@@ -4,3 +4,6 @@
 .envrc
 flake.lock
 flake.nix
+
+# Compiled binary
+/elephant-index
