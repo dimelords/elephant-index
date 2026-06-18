@@ -125,7 +125,7 @@ func RunIndex(ctx context.Context, p Parameters) error {
 		return nil
 	})
 
-	server.Health.AddReadyFunction("opensearch", func(ctx context.Context) error {
+	server.Health.AddOptionalReadyFunction("opensearch", func(ctx context.Context) error {
 		q := postgres.New(p.Database)
 
 		active, err := q.GetActiveIndexSet(ctx)
@@ -137,12 +137,15 @@ func RunIndex(ctx context.Context, p Parameters) error {
 
 		client, err := p.Client(ctx, active.Cluster.String)
 		if err != nil {
-			return fmt.Errorf("gect cluster client: %w", err)
+			return fmt.Errorf("get cluster client: %w", err)
 		}
+
+		reqCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		defer cancel()
 
 		get := client.Indices.Get
 
-		res, err := get([]string{"documents-*"}, get.WithContext(ctx))
+		res, err := get([]string{"documents-*"}, get.WithContext(reqCtx))
 		if err != nil {
 			return fmt.Errorf("list indices: %w", err)
 		}
@@ -150,8 +153,7 @@ func RunIndex(ctx context.Context, p Parameters) error {
 		_ = res.Body.Close()
 
 		if res.StatusCode != http.StatusOK {
-			return fmt.Errorf(
-				"error response from server: %v", res.Status())
+			return fmt.Errorf("error response from server: %v", res.Status())
 		}
 
 		return nil
