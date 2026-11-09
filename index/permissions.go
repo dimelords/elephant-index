@@ -5,7 +5,7 @@ import (
 	"strings"
 
 	"github.com/ttab/elephantine"
-	"github.com/twitchtv/twirp"
+	"github.com/ttab/elephantine/rpc"
 )
 
 const (
@@ -13,15 +13,22 @@ const (
 	ScopeSearch     = "search"
 )
 
+// HTTP header names.
+const (
+	// headerAuthorization carries the bearer token.
+	headerAuthorization = "Authorization"
+	headerContentType   = "Content-Type"
+)
+
 func RequireAnyScope(ctx context.Context, scopes ...string) (*elephantine.AuthInfo, error) {
 	auth, ok := elephantine.GetAuthInfo(ctx)
 	if !ok {
-		return nil, twirp.Unauthenticated.Error(
+		return nil, rpc.Unauthenticated(
 			"no anonymous access allowed")
 	}
 
 	if !auth.Claims.HasAnyScope(scopes...) {
-		return nil, twirp.PermissionDenied.Errorf(
+		return nil, rpc.PermissionDeniedf(
 			"one of the the scopes %s is required",
 			strings.Join(scopes, ", "))
 	}

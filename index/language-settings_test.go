@@ -1,6 +1,8 @@
 package index_test
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/ttab/elephant-index/index"
@@ -61,7 +63,7 @@ func TestGetLanguageSetting(t *testing.T) {
 		})
 
 		lang, err := res.GetLanguageInfo(param.code)
-		test.Must(t, err, "get language info")
+		test.Mustf(t, err, "get language info")
 
 		s := index.GetIndexConfig(lang)
 		idx := index.NewIndexName(
@@ -90,15 +92,86 @@ func TestGetLanguageSetting(t *testing.T) {
 		res := index.NewLanguageResolver(index.LanguageOptions{})
 
 		lang, err := res.GetLanguageInfo("sv-SE")
-		test.Must(t, err, "get language info")
+		test.Mustf(t, err, "get language info")
 
 		idx := index.NewIndexName(
 			index.IndexTypeDocuments,
 			"happy-hog", "core/article#template", lang)
 
-		test.Equal(t, "core_article--template-sv-se", idx.Language,
+		test.Equalf(t, "core_article--template-sv-se", idx.Language,
 			"variant type language name")
-		test.Equal(t, "documents-happy-hog-core_article--template-sv-se", idx.Full,
+		test.Equalf(t, "documents-happy-hog-core_article--template-sv-se", idx.Full,
 			"variant type full name")
 	})
+}
+
+// TestLanguageResolverConcurrentUse is a regression test for ELE-1563: the
+// resolver's memo used to be an unguarded map, and the coordinator hands one
+// resolver to every indexer, so a re-index cutover crashed the process with
+// "fatal error: concurrent map writes". Run it with -race.
+func TestLanguageResolverConcurrentUse(t *testing.T) {
+	codes := []string{
+		"sv-se", "en-gb", "en-us", "it-it", "da-dk", "nb-no", "de-de",
+		"es-es", "fi-fi", "fr-fr", "nl-nl", "pt-br", "pt-pt", "ru-ru",
+		"ja-jp", "th-th", "tr-tr", "el-gr", "cs-cz", "hu-hu",
+	}
+
+	res := index.NewLanguageResolver(index.LanguageOptions{
+		DefaultLanguage: "sv-se",
+	})
+
+	const workers = 8
+
+	var (
+		start sync.WaitGroup
+		done  sync.WaitGroup
+	)
+
+	start.Add(1)
+	done.Add(workers)
+
+	errs := make([]error, workers)
+
+	for w := range workers {
+		go func() {
+			defer done.Done()
+
+			// Line all the goroutines up so they hit the cold cache
+			// at the same time.
+			start.Wait()
+
+			// Each worker walks the whole list from its own offset:
+			// the first lap collides on cold codes, and the laps
+			// that follow race reads against the writes of the
+			// workers still behind.
+			for lap := range 50 {
+				for i := range codes {
+					code := codes[(w+lap+i)%len(codes)]
+
+					info, err := res.GetLanguageInfo(code)
+					if err != nil {
+						errs[w] = fmt.Errorf(
+							"resolve %q: %w", code, err)
+
+						return
+					}
+
+					if info.Code != code {
+						errs[w] = fmt.Errorf(
+							"resolve %q: got code %q",
+							code, info.Code)
+
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	start.Done()
+	done.Wait()
+
+	for w, err := range errs {
+		test.Mustf(t, err, "worker %d", w)
+	}
 }

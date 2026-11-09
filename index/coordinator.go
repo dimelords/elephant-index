@@ -25,6 +25,42 @@ import (
 
 const IndexerStopTimeout = 10 * time.Second
 
+// subscriberRetryOptions restarts the notification subscriber about every
+// five seconds for as long as it keeps failing, the same pacing elephant-user
+// and elephant-repository give theirs. Pinning the floor, the ceiling and the
+// minimum runtime to the same value flattens the library's exponential curve
+// into a static five second backoff: while the subscriber is down, index set
+// changes wait for the next reconciliation and percolation for its poll, so a
+// restart that backed off towards the default one minute ceiling would
+// stretch an outage for the price of one connection attempt per replica every
+// five seconds. GiveUpAfter is left at zero, so it never gives up.
+var subscriberRetryOptions = elephantine.RetryOptions{
+	BackoffFloor: 5 * time.Second,
+	BackoffCeil:  5 * time.Second,
+	MinRuntime:   5 * time.Second,
+}
+
+// DefaultIndexSetReconcileInterval is how often the coordinator re-reads the
+// index sets from the database. The index_status_change notification is a
+// latency optimisation on top of this, not the only way an activation reaches
+// a replica.
+const DefaultIndexSetReconcileInterval = 30 * time.Second
+
+// The triggers that can bring a replica in line with the index sets in the
+// database, used as the label on elephant_indexer_index_set_sync_total.
+const (
+	syncTriggerStartup      = "startup"
+	syncTriggerNotification = "notification"
+	syncTriggerReconnect    = "reconnect"
+	syncTriggerTick         = "tick"
+)
+
+// indexSetQueryTimeout bounds the read at the start of a reconciliation. A
+// silently dead Postgres connection would otherwise block the event loop for
+// the TCP retransmit period with nothing logged, which is precisely the
+// undetected-stall state the reconciliation exists to rule out.
+const indexSetQueryTimeout = 10 * time.Second
+
 const (
 	ChanIndexStatusChange string = "index_status_change"
 	ChanPercolatorUpdate  string = "percolator_update"
@@ -59,6 +95,16 @@ type CoordinatorOptions struct {
 	Sharding        ShardingPolicy
 	PercolatorCache *PercolatorDocCache
 	NoIndexing      bool
+
+	// ListenDatabase is the pool the notification subscriber takes its
+	// LISTEN connection from. It has to be a direct connection to
+	// PostgreSQL, as LISTEN does not work through a transaction pooler.
+	// Nil means the pool the coordinator was created with.
+	ListenDatabase *pgxpool.Pool
+
+	// ReconcileInterval overrides how often the index sets are re-read from
+	// the database. Zero means DefaultIndexSetReconcileInterval.
+	ReconcileInterval time.Duration
 }
 
 type LanguageOptions struct {
@@ -94,22 +140,33 @@ type Coordinator struct {
 	nameRng    *rand.Rand
 	db         *pgxpool.Pool
 	q          *postgres.Queries
-	startCount int32
+	startCount atomic.Int32
 	lang       *LanguageResolver
 
-	activeMut    sync.RWMutex
-	activeClient *opensearch.Client
-	activeSet    string
+	activeMut     sync.RWMutex
+	activeClient  *opensearch.Client
+	activeSet     string
+	activeCluster string
 
 	indexers     map[string]*Indexer
 	indexerCtx   context.Context
 	indexerGroup *errgroup.Group
+
+	// activeMissing records that the last reconciliation found no active
+	// index set, so the warning is logged on the transition rather than on
+	// every pass. Owned by the coordinator event loop.
+	activeMissing bool
 
 	percolator *Percolator
 	percDocs   *PercolatorDocCache
 
 	indexStatuses *pg.FanOut[IndexStatusChange]
 	changes       chan IndexStatusChange
+
+	// reconcile carries a request to re-read every index set from the
+	// database. Buffered to depth one so that requests coalesce and the
+	// sender never blocks on the event loop.
+	reconcile chan struct{}
 
 	percolatorUpdate *pg.FanOut[PercolatorUpdate]
 	percolateEvent   *pg.FanOut[PercolateEvent]
@@ -149,6 +206,7 @@ func NewCoordinator(
 		percolateEvent:   pg.NewFanOut[PercolateEvent](ChanPercolateEvent),
 		eventPercolated:  pg.NewFanOut[EventPercolated](ChanPercolated),
 		changes:          make(chan IndexStatusChange),
+		reconcile:        make(chan struct{}, 1),
 		indexers:         make(map[string]*Indexer),
 		indexerCtx:       gCtx,
 		indexerGroup:     indexGrp,
@@ -183,7 +241,7 @@ func (c *Coordinator) Run(ctx context.Context) error {
 		cancel()
 	}()
 
-	count := atomic.AddInt32(&c.startCount, 1)
+	count := c.startCount.Add(1)
 	if count > 1 {
 		return errors.New("already started")
 	}
@@ -197,20 +255,49 @@ func (c *Coordinator) Run(ctx context.Context) error {
 		c.eventPercolated,
 	}
 
-	sub := pg.NewSubscriber(c.logger, c.db, fanOuts)
+	// A notification that is sent while the LISTEN connection is silently
+	// dead is lost for good, so every connect and reconnect asks the event
+	// loop for a full reconciliation rather than trusting that nothing
+	// happened while we were away.
+	listenDB := c.opt.ListenDatabase
+	if listenDB == nil {
+		listenDB = c.db
+	}
 
-	go func() {
-		err := sub.Run(stopCtx)
-		if err != nil && !errors.Is(err, context.Canceled) {
-			// Stop if the subscriber fails.
-			c.stopOnce.Do(func() {
-				close(c.stop)
-			})
+	sub := pg.NewSubscriber(c.logger, listenDB, fanOuts,
+		pg.WithOnReconnect(func(_ context.Context) error {
+			c.requestReconcile()
 
-			c.logger.ErrorContext(stopCtx, "notification subscriber stopped",
-				elephantine.LogKeyError, err)
-		}
-	}()
+			return nil
+		}),
+	)
+
+	// The subscriber reconnects by itself when its own pings stop
+	// arriving, but returns on other connection errors, such as a database
+	// failover resetting the LISTEN connection. Restart it for as long as
+	// it keeps failing rather than stopping the coordinator, and with it
+	// the process, over a connection that can be re-established: every
+	// restart runs the reconnect hook above, so whatever was missed while
+	// it was down is reconciled on the way back.
+	listenerOpts := []elephantine.ErrGroupOption{}
+
+	if c.opt.Metrics != nil && c.opt.Metrics.Registerer != nil {
+		listenerOpts = append(listenerOpts,
+			elephantine.WithErrGroupMetricsRegisterer(
+				c.opt.Metrics.Registerer))
+	}
+
+	listener := elephantine.NewErrGroup(stopCtx, c.logger, listenerOpts...)
+
+	listener.GoWithRetries("pubsub", subscriberRetryOptions,
+		func(ctx context.Context) error {
+			err := sub.Run(ctx)
+			if err != nil && ctx.Err() == nil {
+				return fmt.Errorf("run subscriber: %w", err)
+			}
+
+			return nil
+		})
 
 	go func() {
 		c.indexStatuses.ListenAll(stopCtx, c.changes)
@@ -248,6 +335,15 @@ func (c *Coordinator) Run(ctx context.Context) error {
 		errs = append(errs, err)
 	}
 
+	// The event loop has returned, so either the context is done or the
+	// coordinator was asked to stop; both cancel stopCtx and with it the
+	// subscriber, which makes this a wait rather than a stop.
+	err = listener.Wait()
+	if err != nil {
+		errs = append(errs,
+			fmt.Errorf("notification subscriber: %w", err))
+	}
+
 	err = c.finalise()
 	if err != nil {
 		errs = append(errs,
@@ -280,50 +376,236 @@ func (c *Coordinator) finalise() error {
 	}
 }
 
+// requestReconcile asks the event loop to re-read every index set. It never
+// blocks: a request already queued covers the caller as well.
+func (c *Coordinator) requestReconcile() {
+	select {
+	case c.reconcile <- struct{}{}:
+	default:
+	}
+}
+
 func (c *Coordinator) runEventloop(
 	ctx context.Context,
 ) error {
-	q := postgres.New(c.db)
+	err := c.reconcileSets(ctx)
 
-	sets, err := q.GetIndexSets(ctx)
+	c.recordSetSync(syncTriggerStartup, err)
+
+	if err != nil {
+		return fmt.Errorf("initial index set reconciliation: %w", err)
+	}
+
+	ticker := time.NewTicker(c.reconcileInterval())
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case change, ok := <-c.changes:
+			if !ok {
+				// The fan-out listener has been stopped, which
+				// only happens once the coordinator is stopping.
+				// Reading on would hand handleChange a zero
+				// value and have it fail on an index set with
+				// no name.
+				return ctx.Err()
+			}
+
+			err := c.handleChange(ctx, change)
+
+			c.recordSetSync(syncTriggerNotification, err)
+
+			if err != nil {
+				c.logger.ErrorContext(ctx,
+					"failed to apply an index set change, reconciling instead",
+					"set_name", change.Name,
+					elephantine.LogKeyError, err)
+
+				// The sweep reads every set rather than the
+				// one the notification named, so it is a
+				// strictly better attempt at the same work.
+				// Queued rather than run here so that it goes
+				// through the same path as every other
+				// reconciliation, and so that a notification
+				// waiting behind this one is handled first.
+				c.requestReconcile()
+			}
+		case <-c.reconcile:
+			c.reconcileOrLog(ctx, syncTriggerReconnect)
+		case <-ticker.C:
+			c.reconcileOrLog(ctx, syncTriggerTick)
+		}
+	}
+}
+
+// reconcileOrLog runs a reconciliation and logs a failure instead of stopping
+// the event loop. Unlike a notification, a reconciliation always has another
+// attempt coming one interval later, so turning a transient database error
+// into a process exit would only turn a Postgres failover into a crash loop on
+// every replica.
+func (c *Coordinator) reconcileOrLog(ctx context.Context, trigger string) {
+	err := c.reconcileSets(ctx)
+
+	c.recordSetSync(trigger, err)
+
+	if err != nil {
+		c.logger.ErrorContext(ctx, "failed to reconcile index sets",
+			"trigger", trigger,
+			"retry_in", c.reconcileInterval().String(),
+			elephantine.LogKeyError, err)
+	}
+}
+
+// recordSetSync counts an attempt to bring this replica in line with the
+// index sets in the database.
+//
+// The successes are as much the point as the failures: they are the only
+// evidence that a replica's event loop is still running at all, which nothing
+// else reports. A `tick` success rate that has gone to zero on one replica is
+// a stalled event loop, and that replica's routing is frozen wherever it
+// happened to be.
+func (c *Coordinator) recordSetSync(trigger string, err error) {
+	result := "ok"
+	if err != nil {
+		result = "failed"
+	}
+
+	c.opt.Metrics.indexSetSync.WithLabelValues(trigger, result).Inc()
+}
+
+func (c *Coordinator) reconcileInterval() time.Duration {
+	if c.opt.ReconcileInterval > 0 {
+		return c.opt.ReconcileInterval
+	}
+
+	return DefaultIndexSetReconcileInterval
+}
+
+// reconcileSets brings this replica in line with the index sets in the
+// database: it starts and stops indexers and resolves the active set and its
+// client. Everything else is a notification that saves us waiting for the next
+// reconciliation; this is the path that is authoritative.
+func (c *Coordinator) reconcileSets(ctx context.Context) error {
+	readCtx, cancel := context.WithTimeout(ctx, indexSetQueryTimeout)
+	defer cancel()
+
+	sets, err := c.q.GetIndexSets(readCtx)
 	if err != nil {
 		return fmt.Errorf("failed to get the current index sets: %w", err)
 	}
 
+	return c.applyIndexSets(ctx, sets)
+}
+
+// applyIndexSets is the half of a reconciliation that acts on what the
+// database said. Split out from the read so that it can be exercised without
+// a database.
+//
+// It must only be called from the coordinator event loop, as setUpdate mutates
+// the unsynchronised indexers map.
+//
+// Sets are independent, so one that cannot be applied must not stop the
+// others: a set whose cluster is unreachable would otherwise block the
+// active-set switch for every set after it in the list, which is the drift
+// this whole mechanism exists to prevent. The failures are collected and
+// returned together, and the caller logs and comes back next interval.
+func (c *Coordinator) applyIndexSets(
+	ctx context.Context, sets []postgres.IndexSet,
+) error {
+	var (
+		errs        []error
+		activeFound bool
+	)
+
+	known := make(map[string]bool, len(sets))
+
 	for _, set := range sets {
+		known[set.Name] = true
+
+		if set.Active {
+			activeFound = true
+		}
+
 		if c.opt.NoIndexing {
 			if set.Active {
 				err := c.ensureActiveClient(set)
 				if err != nil {
-					return fmt.Errorf(
+					errs = append(errs, fmt.Errorf(
 						"failed to ensure active client %q: %w",
-						set.Name, err)
+						set.Name, err))
 				}
 			}
 
 			continue
 		}
 
-		err = c.setUpdate(ctx, set)
+		err := c.setUpdate(ctx, set)
 		if err != nil {
-			return fmt.Errorf(
+			errs = append(errs, fmt.Errorf(
 				"set up index set %q: %w",
 				set.Name, err,
-			)
+			))
 		}
 	}
 
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err() //nolint:wrapcheck
-		case change := <-c.changes:
-			err := c.handleChange(ctx, change)
-			if err != nil {
-				return err
-			}
+	// GetIndexSets excludes deleted sets, so a set that was deleted while we
+	// missed its notification is simply absent here. Its indexer would
+	// otherwise keep following the log into indices that are being removed.
+	for name, idxr := range c.indexers {
+		if known[name] {
+			continue
+		}
+
+		delete(c.indexers, name)
+
+		// Stop only fails by timing out, and it has already signalled
+		// the indexer to stop by then, so there is nothing a retry
+		// would do and no reason to abandon the rest of the sweep.
+		err := idxr.Stop(IndexerStopTimeout)
+		if err != nil {
+			c.logger.ErrorContext(ctx,
+				"indexer for a removed index set did not stop in time",
+				"set_name", name,
+				elephantine.LogKeyError, err)
 		}
 	}
+
+	c.noteActiveSetPresence(activeFound)
+
+	return errors.Join(errs...)
+}
+
+// noteActiveSetPresence warns when the database holds no active index set.
+//
+// The read path is deliberately left pointing at whatever it last had. An
+// active set can only be replaced by another one through the API, so this
+// state is only reachable by hand, and in that case a replica that keeps
+// serving slightly stale results is the better of the two failures: dropping
+// the client would make GetActiveIndex return nil, and the percolator's
+// cleanup and subscription goroutines use that client without a nil check and
+// without a recover, so every replica would exit instead.
+//
+// The warning is logged on the transition rather than on every reconciliation.
+func (c *Coordinator) noteActiveSetPresence(activeFound bool) {
+	if activeFound {
+		c.activeMissing = false
+
+		return
+	}
+
+	if c.activeMissing {
+		return
+	}
+
+	c.activeMissing = true
+
+	_, current := c.GetActiveIndex()
+
+	c.logger.Warn("no index set is marked active in the database",
+		"serving_set_name", current,
+	)
 }
 
 func (c *Coordinator) handleChange(
@@ -495,12 +777,15 @@ func (c *Coordinator) finaliseSetDelete(
 	return nil
 }
 
+// ensureActiveClient points the read path at the given index set. The cluster
+// is part of the comparison, not just the name: a set that is moved to another
+// cluster keeps its name, and reacting only to the name would leave every
+// search going to the cluster the set no longer lives in.
 func (c *Coordinator) ensureActiveClient(set postgres.IndexSet) error {
 	c.activeMut.Lock()
 	defer c.activeMut.Unlock()
 
-	current := c.activeSet
-	if current == set.Name {
+	if c.activeSet == set.Name && c.activeCluster == set.Cluster.String {
 		return nil
 	}
 
@@ -511,8 +796,27 @@ func (c *Coordinator) ensureActiveClient(set postgres.IndexSet) error {
 			set.Cluster.String, err)
 	}
 
+	previousSet := c.activeSet
+	previousCluster := c.activeCluster
+
 	c.activeClient = client
 	c.activeSet = set.Name
+	c.activeCluster = set.Cluster.String
+
+	// Logged at info because this is the only after-the-fact record of which
+	// replicas picked an activation up, and the metric below only says where
+	// a replica is now.
+	c.logger.Info("switched active index set",
+		"previous_set_name", previousSet,
+		"previous_cluster", previousCluster,
+		"set_name", set.Name,
+		"cluster", set.Cluster.String,
+	)
+
+	c.opt.Metrics.activeIndexSet.Reset()
+	c.opt.Metrics.activeIndexSet.WithLabelValues(
+		set.Name, set.Cluster.String,
+	).Set(1)
 
 	return nil
 }
@@ -693,7 +997,6 @@ func (c *Coordinator) cleanupLoop(ctx context.Context) {
 
 // Delete old index sets that have been marked as deleted.
 func (c *Coordinator) cleanup(ctx context.Context) error {
-	//nolint:wrapcheck
 	return pg.WithTX(ctx, c.db, func(tx pgx.Tx) error {
 		q := postgres.New(tx)
 
@@ -727,7 +1030,6 @@ func (c *Coordinator) EnsureDefaultIndexSet(
 	defaultClusterURL *url.URL,
 	clusterAuth ClusterAuth,
 ) error {
-	//nolint:wrapcheck
 	return pg.WithTX(ctx, c.db, func(tx pgx.Tx) error {
 		q := postgres.New(tx)
 

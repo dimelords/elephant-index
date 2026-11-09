@@ -14,12 +14,12 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/opensearch-project/opensearch-go/v2"
-	"github.com/ttab/elephant-api/newsdoc"
 	"github.com/ttab/elephant-api/repository"
 	"github.com/ttab/elephant-index/internal"
 	"github.com/ttab/elephant-index/postgres"
 	"github.com/ttab/elephantine"
 	"github.com/ttab/elephantine/pg"
+	"github.com/ttab/elephantine/pg/joblock"
 	"github.com/ttab/koonkie"
 	"github.com/ttab/revisor"
 	"golang.org/x/sync/errgroup"
@@ -127,13 +127,6 @@ func (idx *Indexer) Run(ctx context.Context) error {
 		idx.logger.Info("indexer has stopped")
 	}()
 
-	lock, err := pg.NewJobLock(idx.database, idx.logger,
-		"indexer-"+idx.name,
-		pg.JobLockOptions{})
-	if err != nil {
-		return fmt.Errorf("create job lock: %w", err)
-	}
-
 	// Set up a context that will be cancelled if we're asked to stop.
 	lockContext, cancel := context.WithCancel(ctx)
 
@@ -142,7 +135,17 @@ func (idx *Indexer) Run(ctx context.Context) error {
 		cancel()
 	}()
 
-	err = lock.RunWithContext(lockContext, idx.indexerLoop)
+	// joblock.Run re-acquires the lock whenever the loop returns, which it
+	// does when the lock is lost. A single RunWithContext would leave the
+	// indexer stopped but still registered with the coordinator, so the
+	// replica never contends for the lock again and reconciliation sees
+	// nothing to fix. A Postgres blip that cost every replica its lock in
+	// turn has stopped indexing that way.
+	err := joblock.Run(lockContext, idx.database, idx.logger,
+		"indexer", "indexer-"+idx.name,
+		joblock.Options{
+			MetricsRegisterer: idx.metrics.Registerer,
+		}, idx.indexerLoop)
 	if err != nil && !errors.Is(err, context.Canceled) {
 		return fmt.Errorf("run indexer loop: %w", err)
 	}
@@ -197,8 +200,6 @@ type enrichJob struct {
 	UUID       string
 	Operation  int
 	State      *DocumentState
-	doc        *newsdoc.Document
-	metadoc    *newsdoc.Document
 	fields     map[string][]string
 }
 

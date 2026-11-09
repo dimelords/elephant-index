@@ -20,6 +20,7 @@ import (
 	"github.com/ttab/elephant-index/postgres"
 	"github.com/ttab/elephantine"
 	"github.com/ttab/elephantine/pg"
+	"github.com/ttab/elephantine/pg/joblock"
 	"github.com/ttab/flerr"
 )
 
@@ -117,7 +118,7 @@ func NewPercolator(
 	}
 
 	for _, def := range defs {
-		p.registerPercolator(def)
+		p.registerPercolator(newPercolatorReference(def))
 	}
 
 	// Get notified when percolators are created or deleted.
@@ -279,7 +280,7 @@ func (p *Percolator) cleanup(ctx context.Context) {
 func (p *Percolator) purgePercolator(
 	ctx context.Context, client *opensearch.Client, id int64, docType string,
 ) error {
-	return pg.WithTX(ctx, p.db, func(tx pgx.Tx) (outErr error) { //nolint: wrapcheck
+	return pg.WithTX(ctx, p.db, func(tx pgx.Tx) (outErr error) {
 		q := postgres.New(tx)
 
 		var clean flerr.Cleaner
@@ -333,43 +334,40 @@ func (p *Percolator) purgePercolator(
 }
 
 func (p *Percolator) percolationLoop(ctx context.Context) {
-	for {
-		p.metrics.percolatorLife.WithLabelValues("acquire-lock").Inc()
-
-		lock, err := pg.NewJobLock(
-			p.db, p.log, "percolator",
-			pg.JobLockOptions{})
-		if err != nil {
-			p.log.ErrorContext(ctx, "failed to create percolator job lock",
-				elephantine.LogKeyError, err)
-
-			time.Sleep(1 * time.Second)
-
-			continue
-		}
-
-		err = lock.RunWithContext(ctx, p.percolateEvents)
-		if err != nil {
-			p.log.ErrorContext(ctx, "failed to percolate events",
-				elephantine.LogKeyError, err)
-
-			time.Sleep(1 * time.Second)
-
-			continue
-		}
-
-		break
+	// percolateEvents returns nil when the lock is lost, so this has to
+	// keep contending for it rather than treat a nil return as done. See
+	// Indexer.Run.
+	err := joblock.Run(ctx, p.db, p.log,
+		"percolator", "percolator",
+		joblock.Options{
+			MetricsRegisterer: p.metrics.Registerer,
+		}, p.percolateEvents)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		p.log.ErrorContext(ctx, "percolator stopped",
+			elephantine.LogKeyError, err)
 	}
 }
 
 const minPercolateInterval = 5 * time.Second
 
 func (p *Percolator) percolateEvents(ctx context.Context) error {
+	p.metrics.percolatorLife.WithLabelValues("acquire-lock").Inc()
 	p.metrics.percolatorLife.WithLabelValues("start").Inc()
 
 	defer p.metrics.percolatorLife.WithLabelValues("stop").Inc()
 
 	q := postgres.New(p.db)
+
+	// Another replica may have held the lock since we last did, so resume
+	// from the persisted position rather than from our own.
+	state, err := q.GetAppState(ctx, "percolator")
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("read percolator state: %w", err)
+	}
+
+	if state.Percolator != nil {
+		p.lastEvent = state.Percolator.CurrentPosition
+	}
 
 	timer := time.NewTicker(minPercolateInterval)
 
@@ -491,9 +489,22 @@ func (p *Percolator) preseedQuery(
 
 	index := NewIndexName(IndexTypePercolate, set, percolator.DocType, language)
 
+	// Both failures here leave a registered subscription whose query is not
+	// percolated against, which is what query-doc-error is the signal for.
+	// The lazy path counts it, so this one has to as well, or the runbook
+	// is only true for half the ways it happens.
 	err = p.createPercolatorDocument(ctx, client, index.Full, ref)
 	if err != nil {
+		p.metrics.percolatorLife.WithLabelValues("query-doc-error").Inc()
+
 		return err
+	}
+
+	err = p.refreshIndex(ctx, client, index.Full)
+	if err != nil {
+		p.metrics.percolatorLife.WithLabelValues("query-doc-error").Inc()
+
+		return fmt.Errorf("refresh index: %w", err)
 	}
 
 	ref.HasDocument[index.Full] = true
@@ -542,33 +553,40 @@ func (p *Percolator) ensurePercolatorQueries(
 	}
 
 	if written > 0 {
-		err := p.flushIndex(ctx, client, index)
+		err := p.refreshIndex(ctx, client, index)
 		if err != nil {
-			return fmt.Errorf("flush index: %w", err)
+			return fmt.Errorf("refresh index: %w", err)
 		}
 	}
 
 	return nil
 }
 
-func (p *Percolator) flushIndex(
+// refreshIndex makes the percolator queries written to the index evaluable.
+//
+// A refresh, not a flush: a flush is a Lucene commit, so it makes the write
+// durable without reopening the searcher, and a query that has only been
+// flushed stays invisible to percolation until the next periodic refresh.
+// Percolating against an index whose queries are not all visible reports a
+// document that should match as a non-match, so the error is returned rather
+// than logged — the percolator retries the event from its last position, and
+// a wrong answer is worse than a late one.
+func (p *Percolator) refreshIndex(
 	ctx context.Context, client *opensearch.Client, index string,
 ) (outErr error) {
-	// Flush the index so that we're guaranteed that the written
-	// queries are evaluated.
-	res, err := client.Indices.Flush(
-		client.Indices.Flush.WithContext(ctx),
-		client.Indices.Flush.WithIndex(index),
-		client.Indices.Flush.WithWaitIfOngoing(true),
+	res, err := client.Indices.Refresh(
+		client.Indices.Refresh.WithContext(ctx),
+		client.Indices.Refresh.WithIndex(index),
 	)
-
-	defer elephantine.Close("flush response", res.Body, &outErr)
-
-	err = errors.Join(ElasticErrorFromResponse(res), err)
 	if err != nil {
-		p.log.Error(
-			"failed to flush indices after percolator update",
-			elephantine.LogKeyError, err)
+		return fmt.Errorf("make refresh request: %w", err)
+	}
+
+	defer elephantine.Close("refresh response", res.Body, &outErr)
+
+	err = ElasticErrorFromResponse(res)
+	if err != nil {
+		return fmt.Errorf("refresh percolator index: %w", err)
 	}
 
 	return nil
@@ -580,7 +598,7 @@ func (p *Percolator) createPercolatorDocument(
 	index string,
 	perc *PercolatorReference,
 ) error {
-	return pg.WithTX(ctx, p.db, func(tx pgx.Tx) (outErr error) { //nolint: wrapcheck
+	return pg.WithTX(ctx, p.db, func(tx pgx.Tx) (outErr error) {
 		q := postgres.New(tx)
 
 		err := q.RegisterPercolatorDocumentIndex(ctx,
@@ -676,21 +694,18 @@ func (p *Percolator) handleUpdate(
 	ctx context.Context,
 	change PercolatorUpdate,
 ) error {
-	p.pMutex.Lock()
-	defer p.pMutex.Unlock()
-
-	m, knownType := p.percolators[change.DocType]
-
 	if change.Deleted {
-		if knownType {
-			delete(m, change.ID)
-		}
+		p.unregisterPercolator(change.DocType, change.ID)
 
 		return nil
 	}
 
-	_, exists := m[change.ID]
-	if exists {
+	// Safe to check and then register without holding the lock across
+	// both: handlePercolatorUpdates is the only writer of the percolator
+	// set and is a single goroutine. Deletions arrive here too, as a
+	// Deleted update published by purgePercolator, rather than reaching
+	// into the map from the cleanup goroutine.
+	if p.hasPercolator(change.DocType, change.ID) {
 		return nil
 	}
 
@@ -701,34 +716,70 @@ func (p *Percolator) handleUpdate(
 		return fmt.Errorf("load percolator definition: %w", err)
 	}
 
-	ref := p.registerPercolator(def)
+	ref := newPercolatorReference(def)
 
-	err = p.preseedQuery(ctx, def, ref)
-	if err != nil {
-		return fmt.Errorf("preseed percolator document: %w", err)
+	// Seed and refresh before registering, and hold no lock while doing
+	// it. percolateDocument needs a read lock to see the percolator set,
+	// so writing the query document under the write lock stalled
+	// percolation for the length of a Postgres transaction and two
+	// OpenSearch calls. Registering last gives the same guarantee for
+	// free: percolateDocument either does not see this percolator yet,
+	// which is a missed notification the delivery contract allows, or sees
+	// one whose query is already evaluable.
+	seedErr := p.preseedQuery(ctx, def, ref)
+
+	// Registered even when seeding failed. The reference then carries no
+	// index in HasDocument, so ensurePercolatorQueries writes and
+	// refreshes the query before the next document is percolated against
+	// it. Dropping it here would leave the subscription unregistered until
+	// the service restarts.
+	p.registerPercolator(ref)
+
+	if seedErr != nil {
+		return fmt.Errorf("preseed percolator document: %w", seedErr)
 	}
 
 	return nil
 }
 
-func (p *Percolator) registerPercolator(def postgres.Percolator) *PercolatorReference {
-	m, ok := p.percolators[def.DocType]
-	if !ok {
-		m = make(map[int64]*PercolatorReference)
-		p.percolators[def.DocType] = m
-	}
-
-	ref := PercolatorReference{
+func newPercolatorReference(def postgres.Percolator) *PercolatorReference {
+	return &PercolatorReference{
 		ID:          def.ID,
 		DocType:     def.DocType,
 		Language:    def.Language,
 		Query:       def.Query,
 		HasDocument: make(map[string]bool),
 	}
+}
 
-	m[def.ID] = &ref
+// registerPercolator makes the percolator visible to percolateDocument.
+func (p *Percolator) registerPercolator(ref *PercolatorReference) {
+	p.pMutex.Lock()
+	defer p.pMutex.Unlock()
 
-	return &ref
+	m, ok := p.percolators[ref.DocType]
+	if !ok {
+		m = make(map[int64]*PercolatorReference)
+		p.percolators[ref.DocType] = m
+	}
+
+	m[ref.ID] = ref
+}
+
+func (p *Percolator) unregisterPercolator(docType string, id int64) {
+	p.pMutex.Lock()
+	defer p.pMutex.Unlock()
+
+	delete(p.percolators[docType], id)
+}
+
+func (p *Percolator) hasPercolator(docType string, id int64) bool {
+	p.pMutex.RLock()
+	defer p.pMutex.RUnlock()
+
+	_, exists := p.percolators[docType][id]
+
+	return exists
 }
 
 func (p *Percolator) percolateDocument(
@@ -746,6 +797,26 @@ func (p *Percolator) percolateDocument(
 	if err != nil {
 		return fmt.Errorf("marshal percolate document: %w", err)
 	}
+
+	// We want to collect all IDs of the percolators so that we know which
+	// didn't match the query.
+	//
+	// The snapshot has to be taken before the search runs, not after. A
+	// percolator that's registered while the search is in flight has a
+	// query that was evaluable when it was registered, but that wasn't
+	// necessarily in the index the search read. Including it in the
+	// snapshot would report the document as a non-match against a query
+	// that was never run. Taking the snapshot first means such a
+	// percolator either doesn't appear at all, which is a missed
+	// notification, or comes back as a hit and is recorded as a match.
+	p.pMutex.RLock()
+
+	allPercs := make(map[int64]bool, len(p.percolators[doc.Document.Type]))
+	for k := range p.percolators[doc.Document.Type] {
+		allPercs[k] = false
+	}
+
+	p.pMutex.RUnlock()
 
 	res, err := client.Search(
 		client.Search.WithContext(ctx),
@@ -781,17 +852,6 @@ func (p *Percolator) percolateDocument(
 		return fmt.Errorf("unmarshal opensearch response: %w", err)
 	}
 
-	p.pMutex.RLock()
-
-	// We want to collect all IDs of the percolators so that we know which
-	// didn't match the query.
-	allPercs := make(map[int64]bool, len(p.percolators[doc.Document.Type]))
-	for k := range p.percolators[doc.Document.Type] {
-		allPercs[k] = false
-	}
-
-	p.pMutex.RUnlock()
-
 	// Bulk insert arrays.
 	percolators := make([]int64, 0, len(allPercs))
 	matches := make([]bool, 0, len(allPercs))
@@ -802,6 +862,9 @@ func (p *Percolator) percolateDocument(
 			continue
 		}
 
+		// A hit that isn't in the snapshot is a percolator that was
+		// registered while the search was in flight. It matched, so
+		// record it as a match.
 		percolators = append(percolators, id)
 		matches = append(matches, true)
 
